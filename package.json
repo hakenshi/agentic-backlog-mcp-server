@@ -1,18 +1,33 @@
 {
   "name": "@hakenshi/agentic-backlog-mcp-server",
   "version": "0.1.0",
-  "private": true,
+  "private": false,
   "type": "module",
+  "main": "build/index.js",
+  "bin": {
+    "agentic-backlog-mcp": "build/index.js"
+  },
+  "files": [
+    "build"
+  ],
+  "license": "MIT",
   "description": "Local-first MCP backlog server for AI agents",
   "scripts": {
-    "dev": "bun run src/index.ts",
-    "start": "bun run src/index.ts"
+    "build": "tsc && chmod +x build/index.js",
+    "dev": "tsx src/index.ts",
+    "start": "node build/index.js",
+    "prepare": "npm run build"
+  },
+  "engines": {
+    "node": ">=18"
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.17.4",
     "zod": "^3.25.76"
   },
   "devDependencies": {
-    "bun-types": "latest"
+    "@types/node": "^22.19.10",
+    "tsx": "^4.20.5",
+    "typescript": "^5.9.3"
   }
 }

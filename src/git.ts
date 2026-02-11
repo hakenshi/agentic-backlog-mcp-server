@@ -1,9 +1,14 @@
 import { createHash } from "node:crypto";
+import { spawnSync } from "node:child_process";
 
 const runGit = (cwd: string, args: string[]): string => {
-  const proc = Bun.spawnSync({ cmd: ["git", ...args], cwd, stdout: "pipe", stderr: "pipe" });
-  if (proc.exitCode !== 0) return "";
-  return new TextDecoder().decode(proc.stdout).trim();
+  const proc = spawnSync("git", args, {
+    cwd,
+    stdio: ["ignore", "pipe", "pipe"],
+    encoding: "utf8",
+  });
+  if (proc.status !== 0) return "";
+  return (proc.stdout ?? "").trim();
 };
 
 export const detectProject = (cwdInput?: string) => {

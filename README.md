@@ -1,14 +1,8 @@
 # Agentic Backlog MCP Server
 
-Local-first MCP server for AI agent backlog management.
+Local-first MCP server for AI backlog management.
 
-This server is an MCP adapter for a running backlog API (for example the Docker Elysia app).
-
-## Boundary (important)
-
-- MCP is the communication channel agents use.
-- The backlog application/API is the operational source of truth.
-- Skill files are documentation/procedure for agents, not runtime storage or business logic.
+This package runs over `stdio` (Node.js) and forwards MCP tool calls to a running backlog API.
 
 ## Exposed tools
 
@@ -31,42 +25,30 @@ This server is an MCP adapter for a running backlog API (for example the Docker 
 
 ## Requirements
 
-- Bun 1.3+
-- (Optional) OpenCode CLI for `plan_from_context`
+- Node.js 18+
 
-## Run locally
-
-```bash
-bun install
-bun run src/index.ts
-```
-
-## Quick demo (MCP flow)
-
-Typical agent sequence:
-
-1. `backlog.identify_project`
-2. `backlog.create_task`
-3. `backlog.update_task_status` (move to `in_progress`)
-4. `backlog.add_task_note`
-5. `backlog.get_console_table`
-6. `backlog.get_kanban_url`
-
-Useful title-based helpers:
-
-- `backlog.find_tasks_by_title`
-- `backlog.update_task_by_title`
-
-## Required environment
-
-The MCP server talks to the running backlog API:
+## Environment
 
 ```bash
 BACKLOG_API_BASE_URL=http://127.0.0.1:8000
 BACKLOG_API_KEY=
 ```
 
-## MCP config example (project)
+## Run locally
+
+```bash
+npm install
+npm run build
+npm start
+```
+
+For development:
+
+```bash
+npm run dev
+```
+
+## MCP config example
 
 `.mcp.json` file:
 
@@ -74,11 +56,8 @@ BACKLOG_API_KEY=
 {
   "mcpServers": {
     "agentic-backlog": {
-      "command": "bun",
-      "args": [
-        "run",
-        "/ABSOLUTE/PATH/TO/agentic-backlog/mcp-server/src/index.ts"
-      ],
+      "command": "npx",
+      "args": ["-y", "@hakenshi/agentic-backlog-mcp-server"],
       "env": {
         "BACKLOG_API_BASE_URL": "http://127.0.0.1:8000",
         "BACKLOG_API_KEY": ""
@@ -88,9 +67,9 @@ BACKLOG_API_KEY=
 }
 ```
 
-## MCP notes
+## Notes
 
-- This server uses `stdio` transport (ideal for local-first).
+- This server uses `stdio` transport only.
 - Do not use `console.log` in MCP stdio mode (stdout breaks JSON-RPC). Logs must go to `stderr`.
 - `backlog.delete_task` requires explicit `confirm: "DELETE"`.
 - `backlog.plan_from_context` is preview-only by default. Set `apply: true` to persist changes.

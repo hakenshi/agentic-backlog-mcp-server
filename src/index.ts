@@ -1,8 +1,10 @@
+#!/usr/bin/env node
+
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { z } from "zod";
 
-import { detectProject } from "./git";
+import { detectProject } from "./git.js";
 
 const API_BASE_URL = (
   process.env.BACKLOG_API_BASE_URL ?? "http://127.0.0.1:8000"
@@ -720,6 +722,13 @@ server.registerTool(
   },
 );
 
-const transport = new StdioServerTransport();
-await server.connect(transport);
-console.error(`[agentic-backlog-mcp] stdio ready. api=${API_BASE_URL}`);
+const main = async () => {
+  const transport = new StdioServerTransport();
+  await server.connect(transport);
+  console.error(`[agentic-backlog-mcp] stdio ready. api=${API_BASE_URL}`);
+};
+
+main().catch((error) => {
+  console.error("Fatal error in main():", error);
+  process.exit(1);
+});
