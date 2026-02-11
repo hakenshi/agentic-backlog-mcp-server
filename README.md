@@ -68,3 +68,5 @@ BACKLOG_DB_PATH=./data/backlog.sqlite bun run src/index.ts
 
 - This server uses `stdio` transport (ideal for local-first).
 - Do not use `console.log` in MCP stdio mode (stdout breaks JSON-RPC). Logs must go to `stderr`.
+- `backlog.delete_task` requires explicit `confirm: "DELETE"`.
+- `backlog.plan_from_context` is preview-only by default. Set `apply: true` to persist changes.

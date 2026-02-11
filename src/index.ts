@@ -259,6 +259,7 @@ server.registerTool(
     description: "Deletes a task permanently from the local backlog.",
     inputSchema: {
       task_id: z.number().int(),
+      confirm: z.literal("DELETE"),
     },
   },
   async ({ task_id }) => {
@@ -366,12 +367,13 @@ server.registerTool(
       project_id: z.number().int(),
       context: z.string().min(4).max(7000),
       dry_run: z.boolean().optional(),
+      apply: z.boolean().optional(),
       source: z.string().optional(),
       agent_id: z.string().optional(),
       session_id: z.string().optional(),
     },
   },
-  async ({ project_id, context, dry_run, source, agent_id, session_id }) => {
+  async ({ project_id, context, dry_run, apply, source, agent_id, session_id }) => {
     const project = db.query("SELECT * FROM projects WHERE id = ?").get(project_id) as
       | { id: number; name: string; description: string }
       | null;
@@ -386,8 +388,9 @@ server.registerTool(
     const result = planActions({ context, project: { ...project, tasks } });
     const actions = result.actions;
     let applied = 0;
+    const shouldApply = apply ?? (dry_run !== undefined ? !dry_run : false);
 
-    if (!(dry_run ?? false)) {
+    if (shouldApply) {
       for (const action of actions) {
         if (action.action === "create_task" && action.title) {
           const now = nowIso();
@@ -448,7 +451,8 @@ server.registerTool(
           text: JSON.stringify({
             project_id,
             model: result.model,
-            dry_run: dry_run ?? false,
+            dry_run: !shouldApply,
+            applied_mode: shouldApply ? "applied" : "preview",
             error: result.error,
             actions,
             applied,
