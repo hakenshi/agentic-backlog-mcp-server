@@ -4,6 +4,12 @@ Local-first MCP server for AI agent backlog management.
 
 Persistence: local SQLite (single file on host), no external infrastructure.
 
+## Boundary (important)
+
+- MCP is the communication channel agents use.
+- The backlog application/API is the operational source of truth.
+- Skill files are documentation/procedure for agents, not runtime storage or business logic.
+
 ## Exposed tools
 
 - `backlog.identify_project`
