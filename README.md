@@ -36,7 +36,7 @@ This package runs over `stdio` (Node.js) and forwards MCP tool calls to a runnin
 ## Environment
 
 ```bash
-BACKLOG_API_BASE_URL=http://127.0.0.1:38117
+BACKLOG_API_BASE_URL=http://127.0.0.1:38117/api
 BACKLOG_REQUEST_TIMEOUT_MS=1800
 BACKLOG_API_FAIL_FAST_MS=15000
 BACKLOG_API_FAILURE_THRESHOLD=1
@@ -67,7 +67,7 @@ npm run dev
       "command": "npx",
       "args": ["-y", "@hakenshi/agentic-backlog-mcp-server"],
       "env": {
-        "BACKLOG_API_BASE_URL": "http://127.0.0.1:38117"
+        "BACKLOG_API_BASE_URL": "http://127.0.0.1:38117/api"
       }
     }
   }

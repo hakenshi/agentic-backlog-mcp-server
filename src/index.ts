@@ -9,8 +9,11 @@ import { z } from "zod";
 import { detectProject } from "./git.js";
 
 const API_BASE_URL = (
-  process.env.BACKLOG_API_BASE_URL ?? "http://127.0.0.1:38117"
+  process.env.BACKLOG_API_BASE_URL ?? "http://127.0.0.1:38117/api"
 ).replace(/\/$/, "");
+const API_ROOT = API_BASE_URL.endsWith("/api")
+  ? API_BASE_URL
+  : `${API_BASE_URL}/api`;
 const API_KEY = process.env.BACKLOG_API_KEY ?? "";
 
 const statusSchema = z.union([
@@ -134,7 +137,7 @@ const request = async (
     attempt += 1;
 
     try {
-      const response = await withTimeout(`${API_BASE_URL}${path}`, {
+      const response = await withTimeout(`${API_ROOT}${path}`, {
         method: options.method ?? "GET",
         headers,
         body: options.body !== undefined ? JSON.stringify(options.body) : undefined,
@@ -447,7 +450,7 @@ server.registerTool(
       return asError("project_not_found", 404);
     }
 
-    const root = (base_url ?? API_BASE_URL).replace(/\/$/, "");
+    const root = (base_url ?? API_ROOT).replace(/\/$/, "").replace(/\/api$/, "");
     return toSuccess({
       project_id,
       project_name: project.name,
@@ -1047,7 +1050,7 @@ server.registerTool(
 const main = async () => {
   const transport = new StdioServerTransport();
   await server.connect(transport);
-  console.error(`[agentic-backlog-mcp] stdio ready. api=${API_BASE_URL}`);
+  console.error(`[agentic-backlog-mcp] stdio ready. api=${API_ROOT}`);
 };
 
 main().catch((error) => {
