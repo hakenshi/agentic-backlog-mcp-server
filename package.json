@@ -1,6 +1,6 @@
 {
   "name": "@hakenshi/agentic-backlog-mcp-server",
-  "version": "0.1.2",
+  "version": "0.1.3",
   "private": false,
   "type": "module",
   "main": "build/index.js",
