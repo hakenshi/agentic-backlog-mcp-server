@@ -412,7 +412,9 @@ server.registerTool(
         }
 
         if (action.action === "move_task" && action.task_id && action.new_status) {
-          const current = db.query("SELECT status FROM tasks WHERE id = ?").get(action.task_id) as
+          const current = db
+            .query("SELECT status FROM tasks WHERE id = ? AND project_id = ?")
+            .get(action.task_id, project_id) as
             | { status: string }
             | null;
           if (!current) continue;
