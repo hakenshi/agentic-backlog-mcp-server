@@ -2,7 +2,7 @@
 
 Local-first MCP server for AI agent backlog management.
 
-Persistence: local SQLite (single file on host), no external infrastructure.
+This server is an MCP adapter for a running backlog API (for example the Docker Elysia app).
 
 ## Boundary (important)
 
@@ -57,16 +57,13 @@ Useful title-based helpers:
 - `backlog.find_tasks_by_title`
 - `backlog.update_task_by_title`
 
-## Local database
+## Required environment
 
-Default database path:
-
-`~/.agentic-backlog/backlog.sqlite`
-
-To customize:
+The MCP server talks to the running backlog API:
 
 ```bash
-BACKLOG_DB_PATH=./data/backlog.sqlite bun run src/index.ts
+BACKLOG_API_BASE_URL=http://127.0.0.1:8000
+BACKLOG_API_KEY=
 ```
 
 ## MCP config example (project)
@@ -83,9 +80,8 @@ BACKLOG_DB_PATH=./data/backlog.sqlite bun run src/index.ts
         "/ABSOLUTE/PATH/TO/agentic-backlog/mcp-server/src/index.ts"
       ],
       "env": {
-        "BACKLOG_DB_PATH": "/ABSOLUTE/PATH/TO/.agentic-backlog/backlog.sqlite",
-        "OPENCODE_CMD": "opencode",
-        "OPENCODE_MODEL": ""
+        "BACKLOG_API_BASE_URL": "http://127.0.0.1:8000",
+        "BACKLOG_API_KEY": ""
       }
     }
   }

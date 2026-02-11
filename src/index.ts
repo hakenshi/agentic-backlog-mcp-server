@@ -2,10 +2,12 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { z } from "zod";
 
-import { autoMoveByNote } from "./automation";
-import { backlogInfo, db, nowIso } from "./db";
 import { detectProject } from "./git";
-import { planActions } from "./planner";
+
+const API_BASE_URL = (
+  process.env.BACKLOG_API_BASE_URL ?? "http://127.0.0.1:8000"
+).replace(/\/$/, "");
+const API_KEY = process.env.BACKLOG_API_KEY ?? "";
 
 const statusSchema = z.union([
   z.literal("backlog"),
@@ -17,76 +19,127 @@ const statusSchema = z.union([
   z.literal("cancelled"),
 ]);
 
-const prioritySchema = z.union([z.literal("low"), z.literal("medium"), z.literal("high")]);
+const prioritySchema = z.union([
+  z.literal("low"),
+  z.literal("medium"),
+  z.literal("high"),
+]);
 
-type BoardTaskRow = {
+type Project = {
   id: number;
+  name: string;
+  description: string;
+  created_at: string;
+};
+
+type Task = {
+  id: number;
+  project_id: number;
   title: string;
+  description: string;
   status: string;
   priority: string;
+  ai_generated: boolean;
+  blocked_reason: string;
   updated_at: string;
 };
 
-const buildConsoleTable = (rows: BoardTaskRow[]) => {
-  const mapped = rows.map((row) => ({
-    id: String(row.id),
-    title: row.title.length > 48 ? `${row.title.slice(0, 45)}...` : row.title,
-    status: row.status,
-    scrum: row.status === "in_progress" ? "doing" : row.status,
-    priority: row.priority,
-    updated_at: row.updated_at,
-  }));
-
-  const headers = ["id", "title", "status", "scrum", "priority", "updated_at"] as const;
-  const widths = headers.map((header) =>
-    Math.max(header.length, ...mapped.map((row) => row[header].length))
-  );
-
-  const line = (cells: string[]) =>
-    `| ${cells.map((cell, i) => cell.padEnd(widths[i], " ")).join(" | ")} |`;
-  const separator = `+-${widths.map((w) => "-".repeat(w)).join("-+-")}-+`;
-  const head = line(headers.map((x) => x));
-  const body = mapped.map((row) => line(headers.map((h) => row[h]))).join("\n");
-
-  if (mapped.length === 0) {
-    return `${separator}\n${head}\n${separator}\n| ${"(no tasks)".padEnd(widths.reduce((a, b) => a + b + 3, -3), " ")} |\n${separator}`;
-  }
-
-  return `${separator}\n${head}\n${separator}\n${body}\n${separator}`;
+type ApiResult = {
+  ok: boolean;
+  status: number;
+  data: unknown;
 };
 
-const findTaskCandidates = (
-  projectId: number,
-  query: string,
-  limit = 25
-): Array<{ id: number; title: string; status: string; priority: string; updated_at: string; score: number }> => {
+const request = async (
+  path: string,
+  options: {
+    method?: "GET" | "POST" | "PATCH" | "DELETE";
+    body?: unknown;
+  } = {},
+): Promise<ApiResult> => {
+  const headers: Record<string, string> = {};
+  if (options.body !== undefined) {
+    headers["content-type"] = "application/json";
+  }
+  if (API_KEY) {
+    headers["x-backlog-key"] = API_KEY;
+  }
+
+  const response = await fetch(`${API_BASE_URL}${path}`, {
+    method: options.method ?? "GET",
+    headers,
+    body: options.body !== undefined ? JSON.stringify(options.body) : undefined,
+  });
+
+  const text = await response.text();
+  let data: unknown = text;
+  try {
+    data = text ? JSON.parse(text) : null;
+  } catch {
+    data = text;
+  }
+
+  return {
+    ok: response.ok,
+    status: response.status,
+    data,
+  };
+};
+
+const asError = (error: string, status?: number, detail?: unknown) => ({
+  content: [
+    { type: "text" as const, text: JSON.stringify({ error, status, detail }) },
+  ],
+  isError: true,
+});
+
+const toSuccess = (payload: unknown) => ({
+  content: [{ type: "text" as const, text: JSON.stringify(payload) }],
+});
+
+const findTaskCandidates = (tasks: Task[], query: string, limit = 25) => {
   const q = query.trim().toLowerCase();
   if (!q) return [];
 
-  const rows = db
-    .query(
-      "SELECT id, title, status, priority, updated_at FROM tasks WHERE project_id = ? AND lower(title) LIKE ? ORDER BY updated_at DESC LIMIT ?"
-    )
-    .all(projectId, `%${q}%`, limit) as Array<{
-      id: number;
-      title: string;
-      status: string;
-      priority: string;
-      updated_at: string;
-    }>;
-
-  return rows
-    .map((row) => {
-      const title = row.title.toLowerCase();
+  return tasks
+    .filter((task) => task.title.toLowerCase().includes(q))
+    .map((task) => {
+      const title = task.title.toLowerCase();
       const score = title === q ? 100 : title.startsWith(q) ? 80 : 60;
-      return { ...row, score };
+      return {
+        id: task.id,
+        title: task.title,
+        status: task.status,
+        priority: task.priority,
+        updated_at: task.updated_at,
+        score,
+      };
     })
-    .sort((a, b) => b.score - a.score || b.updated_at.localeCompare(a.updated_at));
+    .sort(
+      (a, b) => b.score - a.score || b.updated_at.localeCompare(a.updated_at),
+    )
+    .slice(0, limit);
+};
+
+const getProjects = async () => {
+  const result = await request("/projects");
+  if (!result.ok || !Array.isArray(result.data)) {
+    return null;
+  }
+  return result.data as Project[];
+};
+
+const getProjectTasks = async (projectId: number) => {
+  const result = await request(`/projects/${projectId}/tasks`);
+  if (!result.ok || !Array.isArray(result.data)) {
+    return null;
+  }
+  return result.data as Task[];
 };
 
 const server = new McpServer({
   name: "agentic-backlog-local",
-  version: "0.1.0",
+  version: "0.2.0",
 });
 
 server.registerTool(
@@ -94,7 +147,7 @@ server.registerTool(
   {
     title: "Identify or create project",
     description:
-      "Detects git context from cwd and upserts a local backlog project. Use this before creating or moving tasks.",
+      "Detects git context and resolves/creates a project in the running backlog API (Docker app source of truth).",
     inputSchema: {
       cwd: z.string().optional(),
       name: z.string().optional(),
@@ -103,134 +156,148 @@ server.registerTool(
   },
   async ({ cwd, name, description }) => {
     const detected = detectProject(cwd);
-    const now = nowIso();
+    const marker = `[mcp-key:${detected.key}]`;
 
-    const existing = db.query("SELECT * FROM projects WHERE key = ?").get(detected.key) as
-      | { id: number }
-      | undefined;
-
-    if (!existing) {
-      const info = db
-        .query(
-          "INSERT INTO projects (key, name, description, repo_url, branch, cwd, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)"
-        )
-        .run(
-          detected.key,
-          name?.trim() || detected.suggestedName,
-          description?.trim() || "",
-          detected.repoUrl,
-          detected.branch,
-          detected.root,
-          now,
-          now
-        );
-
-      const row = db.query("SELECT * FROM projects WHERE id = ?").get(Number(info.lastInsertRowid));
-      return {
-        content: [{ type: "text", text: JSON.stringify({ project: row, created: true, dbPath: backlogInfo.dbPath }) }],
-      };
+    const projects = await getProjects();
+    if (!projects) {
+      return asError(
+        "api_unavailable",
+        503,
+        "Could not list projects from backlog API",
+      );
     }
 
-    db.query("UPDATE projects SET updated_at = ?, cwd = ?, branch = ?, repo_url = ? WHERE id = ?").run(
-      now,
-      detected.root,
-      detected.branch,
-      detected.repoUrl,
-      existing.id
+    const existing = projects.find((project) =>
+      project.description.includes(marker),
     );
+    if (existing) {
+      return toSuccess({
+        project: existing,
+        created: false,
+        source: "backlog-api",
+      });
+    }
 
-    const row = db.query("SELECT * FROM projects WHERE id = ?").get(existing.id);
-    return {
-      content: [{ type: "text", text: JSON.stringify({ project: row, created: false, dbPath: backlogInfo.dbPath }) }],
-    };
-  }
+    const resolvedName = name?.trim() || detected.suggestedName;
+    const resolvedDescription = `${marker}${description?.trim() ? ` ${description.trim()}` : ""}`;
+
+    const createResult = await request("/projects", {
+      method: "POST",
+      body: {
+        name: resolvedName,
+        description: resolvedDescription,
+      },
+    });
+
+    if (!createResult.ok) {
+      return asError(
+        "project_create_failed",
+        createResult.status,
+        createResult.data,
+      );
+    }
+
+    return toSuccess({
+      project: createResult.data,
+      created: true,
+      source: "backlog-api",
+    });
+  },
 );
 
 server.registerTool(
   "backlog.list_projects",
   {
     title: "List projects",
-    description: "Lists local backlog projects.",
+    description: "Lists projects from the running backlog API.",
     inputSchema: {
       limit: z.number().int().min(1).max(200).optional(),
     },
   },
   async ({ limit }) => {
-    const max = limit ?? 50;
-    const projects = db
-      .query("SELECT id, key, name, description, repo_url, branch, cwd, created_at, updated_at FROM projects ORDER BY updated_at DESC LIMIT ?")
-      .all(max);
-    return { content: [{ type: "text", text: JSON.stringify({ projects }) }] };
-  }
+    const result = await request("/projects");
+    if (!result.ok || !Array.isArray(result.data)) {
+      return asError("list_projects_failed", result.status, result.data);
+    }
+
+    const projects = (result.data as Project[]).slice(0, limit ?? 50);
+    return toSuccess({ projects });
+  },
 );
 
 server.registerTool(
   "backlog.get_project",
   {
     title: "Get project",
-    description: "Returns project metadata and a compact board summary.",
+    description:
+      "Returns project metadata and board summary from the running backlog API.",
     inputSchema: {
       project_id: z.number().int(),
     },
   },
   async ({ project_id }) => {
-    const project = db.query("SELECT * FROM projects WHERE id = ?").get(project_id);
+    const projects = await getProjects();
+    if (!projects) {
+      return asError("api_unavailable", 503, "Could not list projects");
+    }
+
+    const project = projects.find((row) => row.id === project_id);
     if (!project) {
-      return { content: [{ type: "text", text: JSON.stringify({ error: "project_not_found" }) }], isError: true };
+      return asError("project_not_found", 404);
     }
 
-    const statuses = ["backlog", "todo", "in_progress", "blocked", "review", "done", "cancelled"] as const;
-    const counts: Record<string, number> = {};
-    for (const status of statuses) {
-      const row = db
-        .query("SELECT COUNT(1) as total FROM tasks WHERE project_id = ? AND status = ?")
-        .get(project_id, status) as { total: number };
-      counts[status] = row.total;
+    const boardResult = await request(`/projects/${project_id}/board`);
+    if (!boardResult.ok) {
+      return asError(
+        "project_board_failed",
+        boardResult.status,
+        boardResult.data,
+      );
     }
 
-    return { content: [{ type: "text", text: JSON.stringify({ project, counts }) }] };
-  }
+    return toSuccess({
+      project,
+      counts: (boardResult.data as { counts?: unknown }).counts ?? {},
+    });
+  },
 );
 
 server.registerTool(
   "backlog.get_kanban_url",
   {
     title: "Get kanban URL",
-    description: "Returns a browser URL for the visual kanban board for a project.",
+    description:
+      "Returns a browser URL for visual kanban from the running backlog API.",
     inputSchema: {
       project_id: z.number().int(),
       base_url: z.string().url().optional(),
     },
   },
   async ({ project_id, base_url }) => {
-    const project = db.query("SELECT id, name FROM projects WHERE id = ?").get(project_id) as
-      | { id: number; name: string }
-      | null;
-    if (!project) {
-      return { content: [{ type: "text", text: JSON.stringify({ error: "project_not_found" }) }], isError: true };
+    const projects = await getProjects();
+    if (!projects) {
+      return asError("api_unavailable", 503, "Could not list projects");
     }
 
-    const root = (base_url ?? "http://localhost:8000").replace(/\/$/, "");
-    return {
-      content: [
-        {
-          type: "text",
-          text: JSON.stringify({
-            project_id,
-            project_name: project.name,
-            kanban_url: `${root}/projects/${project_id}/kanban`,
-          }),
-        },
-      ],
-    };
-  }
+    const project = projects.find((row) => row.id === project_id);
+    if (!project) {
+      return asError("project_not_found", 404);
+    }
+
+    const root = (base_url ?? API_BASE_URL).replace(/\/$/, "");
+    return toSuccess({
+      project_id,
+      project_name: project.name,
+      kanban_url: `${root}/projects/${project_id}/kanban`,
+    });
+  },
 );
 
 server.registerTool(
   "backlog.create_task",
   {
     title: "Create task",
-    description: "Creates a task in a project.",
+    description: "Creates a task through the running backlog API.",
     inputSchema: {
       project_id: z.number().int(),
       title: z.string().min(3).max(200),
@@ -241,44 +308,30 @@ server.registerTool(
       external_ref: z.string().optional(),
     },
   },
-  async ({ project_id, title, description, status, priority, source, external_ref }) => {
-    const project = db.query("SELECT id FROM projects WHERE id = ?").get(project_id);
-    if (!project) {
-      return { content: [{ type: "text", text: JSON.stringify({ error: "project_not_found" }) }], isError: true };
+  async ({ project_id, title, description, status, priority }) => {
+    const result = await request(`/projects/${project_id}/tasks`, {
+      method: "POST",
+      body: {
+        title,
+        description,
+        status,
+        priority,
+      },
+    });
+
+    if (!result.ok) {
+      return asError("create_task_failed", result.status, result.data);
     }
 
-    const now = nowIso();
-    const info = db
-      .query(
-        "INSERT INTO tasks (project_id, title, description, status, priority, source, blocked_reason, external_ref, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, '', ?, ?, ?)"
-      )
-      .run(
-        project_id,
-        title,
-        description ?? "",
-        status ?? "backlog",
-        priority ?? "medium",
-        source ?? "agent",
-        external_ref ?? "",
-        now,
-        now
-      );
-
-    const taskId = Number(info.lastInsertRowid);
-    db.query(
-      "INSERT INTO task_events (task_id, from_status, to_status, reason, source, agent_id, session_id, created_at) VALUES (?, NULL, ?, ?, ?, '', '', ?)"
-    ).run(taskId, status ?? "backlog", "Task created", source ?? "agent", now);
-
-    const row = db.query("SELECT * FROM tasks WHERE id = ?").get(taskId);
-    return { content: [{ type: "text", text: JSON.stringify({ task: row }) }] };
-  }
+    return toSuccess({ task: result.data });
+  },
 );
 
 server.registerTool(
   "backlog.list_tasks",
   {
     title: "List tasks",
-    description: "Lists project tasks with optional status filter.",
+    description: "Lists project tasks from the running backlog API.",
     inputSchema: {
       project_id: z.number().int(),
       status: statusSchema.optional(),
@@ -286,51 +339,42 @@ server.registerTool(
     },
   },
   async ({ project_id, status, limit }) => {
-    const max = limit ?? 50;
+    const tasks = await getProjectTasks(project_id);
+    if (!tasks) {
+      return asError("list_tasks_failed", 404);
+    }
 
-    const rows = status
-      ? db
-          .query("SELECT * FROM tasks WHERE project_id = ? AND status = ? ORDER BY id DESC LIMIT ?")
-          .all(project_id, status, max)
-      : db.query("SELECT * FROM tasks WHERE project_id = ? ORDER BY id DESC LIMIT ?").all(project_id, max);
-
-    return { content: [{ type: "text", text: JSON.stringify({ tasks: rows }) }] };
-  }
+    const filtered = status
+      ? tasks.filter((task) => task.status === status)
+      : tasks;
+    return toSuccess({ tasks: filtered.slice(0, limit ?? 50) });
+  },
 );
 
 server.registerTool(
   "backlog.get_task",
   {
     title: "Get task",
-    description: "Returns a single task by id.",
+    description: "Returns a single task by id from the running backlog API.",
     inputSchema: {
       task_id: z.number().int(),
     },
   },
   async ({ task_id }) => {
-    const task = db.query("SELECT * FROM tasks WHERE id = ?").get(task_id);
-    if (!task) {
-      return { content: [{ type: "text", text: JSON.stringify({ error: "task_not_found" }) }], isError: true };
+    const result = await request(`/tasks/${task_id}`);
+    if (!result.ok) {
+      return asError("task_not_found", result.status, result.data);
     }
-
-    const notes = db
-      .query("SELECT id, note, source, agent_id, session_id, created_at FROM task_notes WHERE task_id = ? ORDER BY id DESC")
-      .all(task_id);
-    const events = db
-      .query(
-        "SELECT id, from_status, to_status, reason, source, agent_id, session_id, created_at FROM task_events WHERE task_id = ? ORDER BY id DESC"
-      )
-      .all(task_id);
-
-    return { content: [{ type: "text", text: JSON.stringify({ task, notes, events }) }] };
-  }
+    return toSuccess({ task: result.data });
+  },
 );
 
 server.registerTool(
   "backlog.find_tasks_by_title",
   {
     title: "Find tasks by title",
-    description: "Finds tasks in a project by title keywords to support show/update by name flows.",
+    description:
+      "Finds tasks in a project by title keywords using backlog API task list.",
     inputSchema: {
       project_id: z.number().int(),
       query: z.string().min(1).max(200),
@@ -338,28 +382,26 @@ server.registerTool(
     },
   },
   async ({ project_id, query, limit }) => {
-    const candidates = findTaskCandidates(project_id, query, limit ?? 25);
-    return {
-      content: [
-        {
-          type: "text",
-          text: JSON.stringify({
-            project_id,
-            query,
-            total: candidates.length,
-            candidates,
-          }),
-        },
-      ],
-    };
-  }
+    const tasks = await getProjectTasks(project_id);
+    if (!tasks) {
+      return asError("list_tasks_failed", 404);
+    }
+
+    const candidates = findTaskCandidates(tasks, query, limit ?? 25);
+    return toSuccess({
+      project_id,
+      query,
+      total: candidates.length,
+      candidates,
+    });
+  },
 );
 
 server.registerTool(
   "backlog.update_task",
   {
     title: "Update task",
-    description: "Updates task fields. If status changes, an event is recorded.",
+    description: "Updates task fields through the running backlog API.",
     inputSchema: {
       task_id: z.number().int(),
       title: z.string().min(3).max(200).optional(),
@@ -381,56 +423,36 @@ server.registerTool(
     priority,
     status,
     blocked_reason,
-    external_ref,
     source,
     reason,
-    agent_id,
-    session_id,
   }) => {
-    const existing = db.query("SELECT * FROM tasks WHERE id = ?").get(task_id) as
-      | { title: string; description: string; priority: string; status: string; blocked_reason: string; external_ref: string }
-      | null;
-    if (!existing) {
-      return { content: [{ type: "text", text: JSON.stringify({ error: "task_not_found" }) }], isError: true };
+    const result = await request(`/tasks/${task_id}`, {
+      method: "PATCH",
+      body: {
+        title,
+        description,
+        priority,
+        status,
+        blocked_reason,
+        source,
+        note: reason,
+      },
+    });
+
+    if (!result.ok) {
+      return asError("update_task_failed", result.status, result.data);
     }
 
-    const nextTitle = title ?? existing.title;
-    const nextDescription = description ?? existing.description;
-    const nextPriority = priority ?? existing.priority;
-    const nextStatus = status ?? existing.status;
-    const nextBlockedReason = blocked_reason ?? (nextStatus === "blocked" ? existing.blocked_reason : "");
-    const nextExternalRef = external_ref ?? existing.external_ref;
-    const now = nowIso();
-
-    db.query(
-      "UPDATE tasks SET title = ?, description = ?, priority = ?, status = ?, blocked_reason = ?, external_ref = ?, updated_at = ? WHERE id = ?"
-    ).run(nextTitle, nextDescription, nextPriority, nextStatus, nextBlockedReason, nextExternalRef, now, task_id);
-
-    if (nextStatus !== existing.status) {
-      db.query(
-        "INSERT INTO task_events (task_id, from_status, to_status, reason, source, agent_id, session_id, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)"
-      ).run(
-        task_id,
-        existing.status,
-        nextStatus,
-        reason ?? "Task updated",
-        source ?? "agent",
-        agent_id ?? "",
-        session_id ?? "",
-        now
-      );
-    }
-
-    const task = db.query("SELECT * FROM tasks WHERE id = ?").get(task_id);
-    return { content: [{ type: "text", text: JSON.stringify({ task }) }] };
-  }
+    return toSuccess({ task: result.data });
+  },
 );
 
 server.registerTool(
   "backlog.update_task_by_title",
   {
     title: "Update task by title",
-    description: "Finds a task by title query and updates it. Returns candidates when the match is ambiguous.",
+    description:
+      "Finds a task by title query and updates it through the backlog API.",
     inputSchema: {
       project_id: z.number().int(),
       query: z.string().min(1).max(200),
@@ -454,107 +476,100 @@ server.registerTool(
     priority,
     status,
     blocked_reason,
-    external_ref,
     source,
     reason,
-    agent_id,
-    session_id,
   }) => {
-    const candidates = findTaskCandidates(project_id, query, 15);
+    const tasks = await getProjectTasks(project_id);
+    if (!tasks) {
+      return asError("list_tasks_failed", 404);
+    }
+
+    const candidates = findTaskCandidates(tasks, query, 15);
     if (candidates.length === 0) {
-      return { content: [{ type: "text", text: JSON.stringify({ error: "task_not_found_by_title", query }) }], isError: true };
+      return asError("task_not_found_by_title", 404, { query });
     }
 
     const top = candidates[0];
-    const sameTopScore = candidates.filter((x) => x.score === top.score);
+    const sameTopScore = candidates.filter(
+      (candidate) => candidate.score === top.score,
+    );
     if (top.score < 100 && sameTopScore.length > 1) {
-      return {
-        content: [
-          {
-            type: "text",
-            text: JSON.stringify({
-              error: "ambiguous_match",
-              query,
-              candidates: sameTopScore,
-            }),
-          },
-        ],
-        isError: true,
-      };
+      return asError("ambiguous_match", 409, {
+        query,
+        candidates: sameTopScore,
+      });
     }
 
-    const existing = db.query("SELECT * FROM tasks WHERE id = ?").get(top.id) as
-      | { title: string; description: string; priority: string; status: string; blocked_reason: string; external_ref: string }
-      | null;
-    if (!existing) {
-      return { content: [{ type: "text", text: JSON.stringify({ error: "task_not_found" }) }], isError: true };
-    }
+    const updateResult = await request(`/tasks/${top.id}`, {
+      method: "PATCH",
+      body: {
+        title,
+        description,
+        priority,
+        status,
+        blocked_reason,
+        source,
+        note: reason,
+      },
+    });
 
-    const nextTitle = title ?? existing.title;
-    const nextDescription = description ?? existing.description;
-    const nextPriority = priority ?? existing.priority;
-    const nextStatus = status ?? existing.status;
-    const nextBlockedReason = blocked_reason ?? (nextStatus === "blocked" ? existing.blocked_reason : "");
-    const nextExternalRef = external_ref ?? existing.external_ref;
-    const now = nowIso();
-
-    db.query(
-      "UPDATE tasks SET title = ?, description = ?, priority = ?, status = ?, blocked_reason = ?, external_ref = ?, updated_at = ? WHERE id = ?"
-    ).run(nextTitle, nextDescription, nextPriority, nextStatus, nextBlockedReason, nextExternalRef, now, top.id);
-
-    if (nextStatus !== existing.status) {
-      db.query(
-        "INSERT INTO task_events (task_id, from_status, to_status, reason, source, agent_id, session_id, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)"
-      ).run(
-        top.id,
-        existing.status,
-        nextStatus,
-        reason ?? "Task updated by title",
-        source ?? "agent",
-        agent_id ?? "",
-        session_id ?? "",
-        now
+    if (!updateResult.ok) {
+      return asError(
+        "update_task_failed",
+        updateResult.status,
+        updateResult.data,
       );
     }
 
-    const task = db.query("SELECT * FROM tasks WHERE id = ?").get(top.id);
-    return {
-      content: [
-        {
-          type: "text",
-          text: JSON.stringify({ task, matched_by_title: query, matched_task_id: top.id, match_score: top.score }),
-        },
-      ],
-    };
-  }
+    return toSuccess({
+      task: updateResult.data,
+      matched_by_title: query,
+      matched_task_id: top.id,
+      match_score: top.score,
+    });
+  },
 );
 
 server.registerTool(
   "backlog.delete_task",
   {
     title: "Delete task",
-    description: "Deletes a task permanently from the local backlog.",
+    description: "Deletes a task through the running backlog API.",
     inputSchema: {
       task_id: z.number().int(),
       confirm: z.literal("DELETE"),
     },
   },
   async ({ task_id }) => {
-    const task = db.query("SELECT * FROM tasks WHERE id = ?").get(task_id);
-    if (!task) {
-      return { content: [{ type: "text", text: JSON.stringify({ error: "task_not_found" }) }], isError: true };
+    const getResult = await request(`/tasks/${task_id}`);
+    if (!getResult.ok) {
+      return asError("task_not_found", getResult.status, getResult.data);
     }
 
-    db.query("DELETE FROM tasks WHERE id = ?").run(task_id);
-    return { content: [{ type: "text", text: JSON.stringify({ ok: true, deleted_task: task }) }] };
-  }
+    const deleteResult = await request(`/tasks/${task_id}`, {
+      method: "DELETE",
+    });
+    if (!deleteResult.ok) {
+      return asError(
+        "delete_task_failed",
+        deleteResult.status,
+        deleteResult.data,
+      );
+    }
+
+    return toSuccess({
+      ok: true,
+      deleted_task: (deleteResult.data as { deleted_task?: unknown })
+        .deleted_task,
+    });
+  },
 );
 
 server.registerTool(
   "backlog.update_task_status",
   {
     title: "Update task status",
-    description: "Moves a task between states and records an event.",
+    description: "Moves a task between states through the running backlog API.",
     inputSchema: {
       task_id: z.number().int(),
       status: statusSchema,
@@ -565,42 +580,48 @@ server.registerTool(
       blocked_reason: z.string().optional(),
     },
   },
-  async ({ task_id, status, reason, source, agent_id, session_id, blocked_reason }) => {
-    const task = db.query("SELECT * FROM tasks WHERE id = ?").get(task_id) as { status: string } | null;
-    if (!task) {
-      return { content: [{ type: "text", text: JSON.stringify({ error: "task_not_found" }) }], isError: true };
+  async ({ task_id, status, reason, source, blocked_reason }) => {
+    if (blocked_reason && status === "blocked") {
+      const patchResult = await request(`/tasks/${task_id}`, {
+        method: "PATCH",
+        body: {
+          status,
+          blocked_reason,
+          source,
+          note: reason,
+        },
+      });
+      if (!patchResult.ok) {
+        return asError(
+          "update_task_status_failed",
+          patchResult.status,
+          patchResult.data,
+        );
+      }
+      return toSuccess({ task: patchResult.data });
     }
 
-    const now = nowIso();
-    db.query("UPDATE tasks SET status = ?, blocked_reason = ?, updated_at = ? WHERE id = ?").run(
-      status,
-      blocked_reason ?? "",
-      now,
-      task_id
-    );
-    db.query(
-      "INSERT INTO task_events (task_id, from_status, to_status, reason, source, agent_id, session_id, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)"
-    ).run(
-      task_id,
-      task.status,
-      status,
-      reason ?? "",
-      source ?? "agent",
-      agent_id ?? "",
-      session_id ?? "",
-      now
-    );
+    const result = await request(`/tasks/${task_id}/status`, {
+      method: "PATCH",
+      body: {
+        status,
+        source,
+        note: reason,
+      },
+    });
+    if (!result.ok) {
+      return asError("update_task_status_failed", result.status, result.data);
+    }
 
-    const row = db.query("SELECT * FROM tasks WHERE id = ?").get(task_id);
-    return { content: [{ type: "text", text: JSON.stringify({ task: row }) }] };
-  }
+    return toSuccess({ task: result.data });
+  },
 );
 
 server.registerTool(
   "backlog.add_task_note",
   {
     title: "Add task note",
-    description: "Adds a task note and can auto-move status by note content.",
+    description: "Adds a task note through the running backlog API.",
     inputSchema: {
       task_id: z.number().int(),
       note: z.string().min(2).max(4000),
@@ -610,36 +631,30 @@ server.registerTool(
       apply_automation: z.boolean().optional(),
     },
   },
-  async ({ task_id, note, source, agent_id, session_id, apply_automation }) => {
-    const task = db.query("SELECT id FROM tasks WHERE id = ?").get(task_id);
-    if (!task) {
-      return { content: [{ type: "text", text: JSON.stringify({ error: "task_not_found" }) }], isError: true };
+  async ({ task_id, note, source, apply_automation }) => {
+    const result = await request(`/tasks/${task_id}/notes`, {
+      method: "POST",
+      body: {
+        note,
+        source,
+      },
+    });
+    if (!result.ok) {
+      return asError("add_task_note_failed", result.status, result.data);
     }
 
-    const now = nowIso();
-    db.query(
-      "INSERT INTO task_notes (task_id, note, source, agent_id, session_id, created_at) VALUES (?, ?, ?, ?, ?, ?)"
-    ).run(task_id, note, source ?? "agent", agent_id ?? "", session_id ?? "", now);
-
-    let autoMove: null | { from: string; to: string; reason: string } = null;
-    if (apply_automation ?? true) {
-      autoMove = autoMoveByNote(task_id, note);
-      if (autoMove) {
-        db.query(
-          "INSERT INTO task_events (task_id, from_status, to_status, reason, source, agent_id, session_id, created_at) VALUES (?, ?, ?, ?, 'automation', ?, ?, ?)"
-        ).run(task_id, autoMove.from, autoMove.to, autoMove.reason, agent_id ?? "", session_id ?? "", nowIso());
-      }
-    }
-
-    return { content: [{ type: "text", text: JSON.stringify({ ok: true, auto_move: autoMove }) }] };
-  }
+    return toSuccess({
+      ...(result.data as Record<string, unknown>),
+      apply_automation_requested: apply_automation ?? true,
+    });
+  },
 );
 
 server.registerTool(
   "backlog.plan_from_context",
   {
     title: "Plan tasks from context",
-    description: "Uses local OpenCode to suggest/create backlog actions from free-text project context.",
+    description: "Delegates planning to running backlog API planner endpoint.",
     inputSchema: {
       project_id: z.number().int(),
       context: z.string().min(4).max(7000),
@@ -650,152 +665,61 @@ server.registerTool(
       session_id: z.string().optional(),
     },
   },
-  async ({ project_id, context, dry_run, apply, source, agent_id, session_id }) => {
-    const project = db.query("SELECT * FROM projects WHERE id = ?").get(project_id) as
-      | { id: number; name: string; description: string }
-      | null;
-    if (!project) {
-      return { content: [{ type: "text", text: JSON.stringify({ error: "project_not_found" }) }], isError: true };
-    }
-
-    const tasks = db
-      .query("SELECT id, title, status, priority FROM tasks WHERE project_id = ? ORDER BY id DESC LIMIT 60")
-      .all(project_id);
-
-    const result = planActions({ context, project: { ...project, tasks } });
-    const actions = result.actions;
-    let applied = 0;
+  async ({ project_id, context, dry_run, apply }) => {
     const shouldApply = apply ?? (dry_run !== undefined ? !dry_run : false);
-
-    if (shouldApply) {
-      for (const action of actions) {
-        if (action.action === "create_task" && action.title) {
-          const now = nowIso();
-          const info = db
-            .query(
-              "INSERT INTO tasks (project_id, title, description, status, priority, source, blocked_reason, external_ref, created_at, updated_at) VALUES (?, ?, ?, 'backlog', ?, ?, '', '', ?, ?)"
-            )
-            .run(
-              project_id,
-              action.title,
-              action.description ?? "",
-              action.priority ?? "medium",
-              source ?? "agent",
-              now,
-              now
-            );
-          const taskId = Number(info.lastInsertRowid);
-          db.query(
-            "INSERT INTO task_events (task_id, from_status, to_status, reason, source, agent_id, session_id, created_at) VALUES (?, NULL, 'backlog', ?, ?, ?, ?, ?)"
-          ).run(taskId, action.reason ?? "", source ?? "agent", agent_id ?? "", session_id ?? "", now);
-          applied += 1;
-        }
-
-        if (action.action === "move_task" && action.task_id && action.new_status) {
-          const current = db
-            .query("SELECT status FROM tasks WHERE id = ? AND project_id = ?")
-            .get(action.task_id, project_id) as
-            | { status: string }
-            | null;
-          if (!current) continue;
-
-          db.query("UPDATE tasks SET status = ?, updated_at = ? WHERE id = ?").run(
-            action.new_status,
-            nowIso(),
-            action.task_id
-          );
-          db.query(
-            "INSERT INTO task_events (task_id, from_status, to_status, reason, source, agent_id, session_id, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)"
-          ).run(
-            action.task_id,
-            current.status,
-            action.new_status,
-            action.reason ?? "",
-            source ?? "agent",
-            agent_id ?? "",
-            session_id ?? "",
-            nowIso()
-          );
-          applied += 1;
-        }
-      }
+    const result = await request(`/agent/projects/${project_id}/plan`, {
+      method: "POST",
+      body: {
+        context,
+        dry_run: !shouldApply,
+      },
+    });
+    if (!result.ok) {
+      return asError("plan_from_context_failed", result.status, result.data);
     }
 
-    return {
-      content: [
-        {
-          type: "text",
-          text: JSON.stringify({
-            project_id,
-            model: result.model,
-            dry_run: !shouldApply,
-            applied_mode: shouldApply ? "applied" : "preview",
-            error: result.error,
-            actions,
-            applied,
-          }),
-        },
-      ],
-    };
-  }
+    return toSuccess(result.data);
+  },
 );
 
 server.registerTool(
   "backlog.get_board",
   {
     title: "Get board snapshot",
-    description: "Returns grouped tasks by status for a project.",
+    description: "Returns board grouped snapshot from the running backlog API.",
     inputSchema: {
       project_id: z.number().int(),
     },
   },
   async ({ project_id }) => {
-    const statuses = ["backlog", "todo", "in_progress", "blocked", "review", "done", "cancelled"];
-    const board: Record<string, unknown[]> = {};
-
-    for (const status of statuses) {
-      board[status] = db
-        .query("SELECT id, title, priority, updated_at FROM tasks WHERE project_id = ? AND status = ? ORDER BY id DESC")
-        .all(project_id, status);
+    const result = await request(`/projects/${project_id}/board`);
+    if (!result.ok) {
+      return asError("get_board_failed", result.status, result.data);
     }
-
-    return { content: [{ type: "text", text: JSON.stringify({ project_id, board }) }] };
-  }
+    return toSuccess(result.data);
+  },
 );
 
 server.registerTool(
   "backlog.get_console_table",
   {
     title: "Get board as console table",
-    description: "Returns a console-table style text snapshot of project tasks.",
+    description:
+      "Returns a console-table style board snapshot from backlog API.",
     inputSchema: {
       project_id: z.number().int(),
       limit: z.number().int().min(1).max(300).optional(),
     },
   },
-  async ({ project_id, limit }) => {
-    const max = limit ?? 120;
-    const rows = db
-      .query(
-        "SELECT id, title, status, priority, updated_at FROM tasks WHERE project_id = ? ORDER BY id DESC LIMIT ?"
-      )
-      .all(project_id, max) as BoardTaskRow[];
-
-    return {
-      content: [
-        {
-          type: "text",
-          text: JSON.stringify({
-            project_id,
-            total: rows.length,
-            table: buildConsoleTable(rows),
-          }),
-        },
-      ],
-    };
-  }
+  async ({ project_id }) => {
+    const result = await request(`/projects/${project_id}/board/console-table`);
+    if (!result.ok) {
+      return asError("get_console_table_failed", result.status, result.data);
+    }
+    return toSuccess(result.data);
+  },
 );
 
 const transport = new StdioServerTransport();
 await server.connect(transport);
-console.error(`[agentic-backlog-mcp] stdio ready. db=${backlogInfo.dbPath}`);
+console.error(`[agentic-backlog-mcp] stdio ready. api=${API_BASE_URL}`);
