@@ -54,7 +54,6 @@ npm run dev
 
 ```json
 {
-  "$schema": "https://opencode.ai/config.json",
   "mcp": {
      "agentic-backlog": {
       "command": "npx",
