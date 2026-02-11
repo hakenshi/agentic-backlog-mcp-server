@@ -35,6 +35,22 @@ bun install
 bun run src/index.ts
 ```
 
+## Quick demo (MCP flow)
+
+Typical agent sequence:
+
+1. `backlog.identify_project`
+2. `backlog.create_task`
+3. `backlog.update_task_status` (move to `in_progress`)
+4. `backlog.add_task_note`
+5. `backlog.get_console_table`
+6. `backlog.get_kanban_url`
+
+Useful title-based helpers:
+
+- `backlog.find_tasks_by_title`
+- `backlog.update_task_by_title`
+
 ## Local database
 
 Default database path:
