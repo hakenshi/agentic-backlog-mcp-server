@@ -7,7 +7,7 @@ import { z } from "zod";
 import { detectProject } from "./git.js";
 
 const API_BASE_URL = (
-  process.env.BACKLOG_API_BASE_URL ?? "http://127.0.0.1:8000"
+  process.env.BACKLOG_API_BASE_URL ?? "http://127.0.0.1:38117"
 ).replace(/\/$/, "");
 const API_KEY = process.env.BACKLOG_API_KEY ?? "";
 
