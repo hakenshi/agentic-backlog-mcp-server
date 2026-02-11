@@ -54,8 +54,9 @@ npm run dev
 
 ```json
 {
-  "mcpServers": {
-    "agentic-backlog": {
+  "$schema": "https://opencode.ai/config.json",
+  "mcp": {
+     "agentic-backlog": {
       "command": "npx",
       "args": ["-y", "@hakenshi/agentic-backlog-mcp-server"],
       "env": {
