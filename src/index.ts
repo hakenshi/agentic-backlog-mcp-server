@@ -19,6 +19,71 @@ const statusSchema = z.union([
 
 const prioritySchema = z.union([z.literal("low"), z.literal("medium"), z.literal("high")]);
 
+type BoardTaskRow = {
+  id: number;
+  title: string;
+  status: string;
+  priority: string;
+  updated_at: string;
+};
+
+const buildConsoleTable = (rows: BoardTaskRow[]) => {
+  const mapped = rows.map((row) => ({
+    id: String(row.id),
+    title: row.title.length > 48 ? `${row.title.slice(0, 45)}...` : row.title,
+    status: row.status,
+    scrum: row.status === "in_progress" ? "doing" : row.status,
+    priority: row.priority,
+    updated_at: row.updated_at,
+  }));
+
+  const headers = ["id", "title", "status", "scrum", "priority", "updated_at"] as const;
+  const widths = headers.map((header) =>
+    Math.max(header.length, ...mapped.map((row) => row[header].length))
+  );
+
+  const line = (cells: string[]) =>
+    `| ${cells.map((cell, i) => cell.padEnd(widths[i], " ")).join(" | ")} |`;
+  const separator = `+-${widths.map((w) => "-".repeat(w)).join("-+-")}-+`;
+  const head = line(headers.map((x) => x));
+  const body = mapped.map((row) => line(headers.map((h) => row[h]))).join("\n");
+
+  if (mapped.length === 0) {
+    return `${separator}\n${head}\n${separator}\n| ${"(no tasks)".padEnd(widths.reduce((a, b) => a + b + 3, -3), " ")} |\n${separator}`;
+  }
+
+  return `${separator}\n${head}\n${separator}\n${body}\n${separator}`;
+};
+
+const findTaskCandidates = (
+  projectId: number,
+  query: string,
+  limit = 25
+): Array<{ id: number; title: string; status: string; priority: string; updated_at: string; score: number }> => {
+  const q = query.trim().toLowerCase();
+  if (!q) return [];
+
+  const rows = db
+    .query(
+      "SELECT id, title, status, priority, updated_at FROM tasks WHERE project_id = ? AND lower(title) LIKE ? ORDER BY updated_at DESC LIMIT ?"
+    )
+    .all(projectId, `%${q}%`, limit) as Array<{
+      id: number;
+      title: string;
+      status: string;
+      priority: string;
+      updated_at: string;
+    }>;
+
+  return rows
+    .map((row) => {
+      const title = row.title.toLowerCase();
+      const score = title === q ? 100 : title.startsWith(q) ? 80 : 60;
+      return { ...row, score };
+    })
+    .sort((a, b) => b.score - a.score || b.updated_at.localeCompare(a.updated_at));
+};
+
 const server = new McpServer({
   name: "agentic-backlog-local",
   version: "0.1.0",
@@ -77,6 +142,86 @@ server.registerTool(
     const row = db.query("SELECT * FROM projects WHERE id = ?").get(existing.id);
     return {
       content: [{ type: "text", text: JSON.stringify({ project: row, created: false, dbPath: backlogInfo.dbPath }) }],
+    };
+  }
+);
+
+server.registerTool(
+  "backlog.list_projects",
+  {
+    title: "List projects",
+    description: "Lists local backlog projects.",
+    inputSchema: {
+      limit: z.number().int().min(1).max(200).optional(),
+    },
+  },
+  async ({ limit }) => {
+    const max = limit ?? 50;
+    const projects = db
+      .query("SELECT id, key, name, description, repo_url, branch, cwd, created_at, updated_at FROM projects ORDER BY updated_at DESC LIMIT ?")
+      .all(max);
+    return { content: [{ type: "text", text: JSON.stringify({ projects }) }] };
+  }
+);
+
+server.registerTool(
+  "backlog.get_project",
+  {
+    title: "Get project",
+    description: "Returns project metadata and a compact board summary.",
+    inputSchema: {
+      project_id: z.number().int(),
+    },
+  },
+  async ({ project_id }) => {
+    const project = db.query("SELECT * FROM projects WHERE id = ?").get(project_id);
+    if (!project) {
+      return { content: [{ type: "text", text: JSON.stringify({ error: "project_not_found" }) }], isError: true };
+    }
+
+    const statuses = ["backlog", "todo", "in_progress", "blocked", "review", "done", "cancelled"] as const;
+    const counts: Record<string, number> = {};
+    for (const status of statuses) {
+      const row = db
+        .query("SELECT COUNT(1) as total FROM tasks WHERE project_id = ? AND status = ?")
+        .get(project_id, status) as { total: number };
+      counts[status] = row.total;
+    }
+
+    return { content: [{ type: "text", text: JSON.stringify({ project, counts }) }] };
+  }
+);
+
+server.registerTool(
+  "backlog.get_kanban_url",
+  {
+    title: "Get kanban URL",
+    description: "Returns a browser URL for the visual kanban board for a project.",
+    inputSchema: {
+      project_id: z.number().int(),
+      base_url: z.string().url().optional(),
+    },
+  },
+  async ({ project_id, base_url }) => {
+    const project = db.query("SELECT id, name FROM projects WHERE id = ?").get(project_id) as
+      | { id: number; name: string }
+      | null;
+    if (!project) {
+      return { content: [{ type: "text", text: JSON.stringify({ error: "project_not_found" }) }], isError: true };
+    }
+
+    const root = (base_url ?? "http://localhost:8000").replace(/\/$/, "");
+    return {
+      content: [
+        {
+          type: "text",
+          text: JSON.stringify({
+            project_id,
+            project_name: project.name,
+            kanban_url: `${root}/projects/${project_id}/kanban`,
+          }),
+        },
+      ],
     };
   }
 );
@@ -182,6 +327,35 @@ server.registerTool(
 );
 
 server.registerTool(
+  "backlog.find_tasks_by_title",
+  {
+    title: "Find tasks by title",
+    description: "Finds tasks in a project by title keywords to support show/update by name flows.",
+    inputSchema: {
+      project_id: z.number().int(),
+      query: z.string().min(1).max(200),
+      limit: z.number().int().min(1).max(100).optional(),
+    },
+  },
+  async ({ project_id, query, limit }) => {
+    const candidates = findTaskCandidates(project_id, query, limit ?? 25);
+    return {
+      content: [
+        {
+          type: "text",
+          text: JSON.stringify({
+            project_id,
+            query,
+            total: candidates.length,
+            candidates,
+          }),
+        },
+      ],
+    };
+  }
+);
+
+server.registerTool(
   "backlog.update_task",
   {
     title: "Update task",
@@ -249,6 +423,109 @@ server.registerTool(
 
     const task = db.query("SELECT * FROM tasks WHERE id = ?").get(task_id);
     return { content: [{ type: "text", text: JSON.stringify({ task }) }] };
+  }
+);
+
+server.registerTool(
+  "backlog.update_task_by_title",
+  {
+    title: "Update task by title",
+    description: "Finds a task by title query and updates it. Returns candidates when the match is ambiguous.",
+    inputSchema: {
+      project_id: z.number().int(),
+      query: z.string().min(1).max(200),
+      title: z.string().min(3).max(200).optional(),
+      description: z.string().max(10000).optional(),
+      priority: prioritySchema.optional(),
+      status: statusSchema.optional(),
+      blocked_reason: z.string().max(2000).optional(),
+      external_ref: z.string().max(500).optional(),
+      source: z.string().optional(),
+      reason: z.string().optional(),
+      agent_id: z.string().optional(),
+      session_id: z.string().optional(),
+    },
+  },
+  async ({
+    project_id,
+    query,
+    title,
+    description,
+    priority,
+    status,
+    blocked_reason,
+    external_ref,
+    source,
+    reason,
+    agent_id,
+    session_id,
+  }) => {
+    const candidates = findTaskCandidates(project_id, query, 15);
+    if (candidates.length === 0) {
+      return { content: [{ type: "text", text: JSON.stringify({ error: "task_not_found_by_title", query }) }], isError: true };
+    }
+
+    const top = candidates[0];
+    const sameTopScore = candidates.filter((x) => x.score === top.score);
+    if (top.score < 100 && sameTopScore.length > 1) {
+      return {
+        content: [
+          {
+            type: "text",
+            text: JSON.stringify({
+              error: "ambiguous_match",
+              query,
+              candidates: sameTopScore,
+            }),
+          },
+        ],
+        isError: true,
+      };
+    }
+
+    const existing = db.query("SELECT * FROM tasks WHERE id = ?").get(top.id) as
+      | { title: string; description: string; priority: string; status: string; blocked_reason: string; external_ref: string }
+      | null;
+    if (!existing) {
+      return { content: [{ type: "text", text: JSON.stringify({ error: "task_not_found" }) }], isError: true };
+    }
+
+    const nextTitle = title ?? existing.title;
+    const nextDescription = description ?? existing.description;
+    const nextPriority = priority ?? existing.priority;
+    const nextStatus = status ?? existing.status;
+    const nextBlockedReason = blocked_reason ?? (nextStatus === "blocked" ? existing.blocked_reason : "");
+    const nextExternalRef = external_ref ?? existing.external_ref;
+    const now = nowIso();
+
+    db.query(
+      "UPDATE tasks SET title = ?, description = ?, priority = ?, status = ?, blocked_reason = ?, external_ref = ?, updated_at = ? WHERE id = ?"
+    ).run(nextTitle, nextDescription, nextPriority, nextStatus, nextBlockedReason, nextExternalRef, now, top.id);
+
+    if (nextStatus !== existing.status) {
+      db.query(
+        "INSERT INTO task_events (task_id, from_status, to_status, reason, source, agent_id, session_id, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)"
+      ).run(
+        top.id,
+        existing.status,
+        nextStatus,
+        reason ?? "Task updated by title",
+        source ?? "agent",
+        agent_id ?? "",
+        session_id ?? "",
+        now
+      );
+    }
+
+    const task = db.query("SELECT * FROM tasks WHERE id = ?").get(top.id);
+    return {
+      content: [
+        {
+          type: "text",
+          text: JSON.stringify({ task, matched_by_title: query, matched_task_id: top.id, match_score: top.score }),
+        },
+      ],
+    };
   }
 );
 
@@ -483,6 +760,39 @@ server.registerTool(
     }
 
     return { content: [{ type: "text", text: JSON.stringify({ project_id, board }) }] };
+  }
+);
+
+server.registerTool(
+  "backlog.get_console_table",
+  {
+    title: "Get board as console table",
+    description: "Returns a console-table style text snapshot of project tasks.",
+    inputSchema: {
+      project_id: z.number().int(),
+      limit: z.number().int().min(1).max(300).optional(),
+    },
+  },
+  async ({ project_id, limit }) => {
+    const max = limit ?? 120;
+    const rows = db
+      .query(
+        "SELECT id, title, status, priority, updated_at FROM tasks WHERE project_id = ? ORDER BY id DESC LIMIT ?"
+      )
+      .all(project_id, max) as BoardTaskRow[];
+
+    return {
+      content: [
+        {
+          type: "text",
+          text: JSON.stringify({
+            project_id,
+            total: rows.length,
+            table: buildConsoleTable(rows),
+          }),
+        },
+      ],
+    };
   }
 );
 

@@ -7,15 +7,21 @@ Persistence: local SQLite (single file on host), no external infrastructure.
 ## Exposed tools
 
 - `backlog.identify_project`
+- `backlog.list_projects`
+- `backlog.get_project`
+- `backlog.get_kanban_url`
 - `backlog.create_task`
 - `backlog.list_tasks`
 - `backlog.get_task`
+- `backlog.find_tasks_by_title`
 - `backlog.update_task`
+- `backlog.update_task_by_title`
 - `backlog.delete_task`
 - `backlog.update_task_status`
 - `backlog.add_task_note`
 - `backlog.plan_from_context`
 - `backlog.get_board`
+- `backlog.get_console_table`
 
 ## Requirements
 
