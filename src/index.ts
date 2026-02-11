@@ -1,5 +1,7 @@
 #!/usr/bin/env node
 
+import { randomUUID } from "node:crypto";
+
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { z } from "zod";
@@ -52,13 +54,67 @@ type ApiResult = {
   data: unknown;
 };
 
+const REQUEST_TIMEOUT_MS = Number(process.env.BACKLOG_REQUEST_TIMEOUT_MS ?? 1800);
+const RETRY_DELAYS_MS = [120, 260];
+const API_FAIL_FAST_MS = Number(process.env.BACKLOG_API_FAIL_FAST_MS ?? 15000);
+const API_FAILURE_THRESHOLD = Number(process.env.BACKLOG_API_FAILURE_THRESHOLD ?? 1);
+
+let consecutiveApiFailures = 0;
+let apiUnavailableUntil = 0;
+let lastApiFailureDetail = "";
+
+const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
+
+const withTimeout = async (url: string, init: RequestInit) => {
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS);
+  try {
+    return await fetch(url, { ...init, signal: controller.signal });
+  } finally {
+    clearTimeout(timeout);
+  }
+};
+
+const markApiHealthy = () => {
+  consecutiveApiFailures = 0;
+  apiUnavailableUntil = 0;
+  lastApiFailureDetail = "";
+};
+
+const markApiFailure = (detail: string) => {
+  consecutiveApiFailures += 1;
+  lastApiFailureDetail = detail;
+  if (consecutiveApiFailures >= API_FAILURE_THRESHOLD) {
+    apiUnavailableUntil = Date.now() + API_FAIL_FAST_MS;
+  }
+};
+
+const failFastResponse = (): ApiResult => ({
+  ok: false,
+  status: 503,
+  data: {
+    error: "api_temporarily_unavailable",
+    detail:
+      lastApiFailureDetail ||
+      "Circuit breaker open after repeated failures",
+    retry_after_ms: Math.max(0, apiUnavailableUntil - Date.now()),
+  },
+});
+
 const request = async (
   path: string,
   options: {
     method?: "GET" | "POST" | "PATCH" | "DELETE";
     body?: unknown;
+    idempotencyKey?: string;
+    retries?: boolean;
+    bypassFailFast?: boolean;
   } = {},
 ): Promise<ApiResult> => {
+  if (!options.bypassFailFast && Date.now() < apiUnavailableUntil) {
+    return failFastResponse();
+  }
+
   const headers: Record<string, string> = {};
   if (options.body !== undefined) {
     headers["content-type"] = "application/json";
@@ -67,24 +123,76 @@ const request = async (
     headers["x-backlog-key"] = API_KEY;
   }
 
-  const response = await fetch(`${API_BASE_URL}${path}`, {
-    method: options.method ?? "GET",
-    headers,
-    body: options.body !== undefined ? JSON.stringify(options.body) : undefined,
-  });
+  if (options.idempotencyKey) {
+    headers["x-idempotency-key"] = options.idempotencyKey;
+  }
 
-  const text = await response.text();
-  let data: unknown = text;
-  try {
-    data = text ? JSON.parse(text) : null;
-  } catch {
-    data = text;
+  const maxAttempts = options.retries === false ? 1 : RETRY_DELAYS_MS.length + 1;
+
+  let attempt = 0;
+  while (attempt < maxAttempts) {
+    attempt += 1;
+
+    try {
+      const response = await withTimeout(`${API_BASE_URL}${path}`, {
+        method: options.method ?? "GET",
+        headers,
+        body: options.body !== undefined ? JSON.stringify(options.body) : undefined,
+      });
+
+      const text = await response.text();
+      let data: unknown = text;
+      try {
+        data = text ? JSON.parse(text) : null;
+      } catch {
+        data = text;
+      }
+
+      if (response.status >= 500 && attempt < maxAttempts) {
+        const jitter = Math.floor(Math.random() * 80);
+        await sleep(RETRY_DELAYS_MS[attempt - 1] + jitter);
+        continue;
+      }
+
+      if (response.status >= 500) {
+        markApiFailure(`HTTP ${response.status} from ${path}`);
+      } else {
+        markApiHealthy();
+      }
+
+      return {
+        ok: response.ok,
+        status: response.status,
+        data,
+      };
+    } catch (error) {
+      if (attempt < maxAttempts) {
+        const jitter = Math.floor(Math.random() * 80);
+        await sleep(RETRY_DELAYS_MS[attempt - 1] + jitter);
+        continue;
+      }
+
+      const detail = error instanceof Error ? error.message : String(error);
+      markApiFailure(`Network/timeout error on ${path}: ${detail}`);
+
+      return {
+        ok: false,
+        status: 503,
+        data: {
+          error: "request_failed",
+          detail,
+        },
+      };
+    }
   }
 
   return {
-    ok: response.ok,
-    status: response.status,
-    data,
+    ok: false,
+    status: 503,
+    data: {
+      error: "request_failed",
+      detail: "retry_exhausted",
+    },
   };
 };
 
@@ -133,16 +241,67 @@ const getProjects = async () => {
 
 const getProjectTasks = async (projectId: number) => {
   const result = await request(`/projects/${projectId}/tasks`);
-  if (!result.ok || !Array.isArray(result.data)) {
+  if (!result.ok) {
     return null;
   }
-  return result.data as Task[];
+
+  if (Array.isArray(result.data)) {
+    return result.data as Task[];
+  }
+
+  if (
+    result.data &&
+    typeof result.data === "object" &&
+    Array.isArray((result.data as { tasks?: unknown }).tasks)
+  ) {
+    return (result.data as { tasks: Task[] }).tasks;
+  }
+
+  return null;
 };
 
 const server = new McpServer({
   name: "agentic-backlog-local",
   version: "0.2.0",
 });
+
+server.registerTool(
+  "backlog.health",
+  {
+    title: "Backlog health",
+    description: "Checks backlog API health and connectivity before mutations.",
+    inputSchema: {},
+  },
+  async () => {
+    const result = await request("/health", {
+      retries: true,
+      bypassFailFast: true,
+    });
+    if (!result.ok) {
+      return asError("health_check_failed", result.status, result.data);
+    }
+    return toSuccess(result.data);
+  },
+);
+
+server.registerTool(
+  "backlog.version",
+  {
+    title: "Backlog version",
+    description: "Returns API version and protocol compatibility information.",
+    inputSchema: {},
+  },
+  async () => {
+    const result = await request("/version", {
+      retries: true,
+      bypassFailFast: true,
+    });
+    if (!result.ok) {
+      return asError("version_check_failed", result.status, result.data);
+    }
+    return toSuccess(result.data);
+  },
+);
 
 server.registerTool(
   "backlog.identify_project",
@@ -189,6 +348,8 @@ server.registerTool(
         name: resolvedName,
         description: resolvedDescription,
       },
+      idempotencyKey: randomUUID(),
+      retries: true,
     });
 
     if (!createResult.ok) {
@@ -308,9 +469,12 @@ server.registerTool(
       priority: prioritySchema.optional(),
       source: z.string().optional(),
       external_ref: z.string().optional(),
+      agent_id: z.string().optional(),
+      session_id: z.string().optional(),
+      idempotency_key: z.string().optional(),
     },
   },
-  async ({ project_id, title, description, status, priority }) => {
+  async ({ project_id, title, description, status, priority, source, agent_id, session_id, idempotency_key }) => {
     const result = await request(`/projects/${project_id}/tasks`, {
       method: "POST",
       body: {
@@ -318,7 +482,12 @@ server.registerTool(
         description,
         status,
         priority,
+        source,
+        agent_id,
+        session_id,
       },
+      idempotencyKey: idempotency_key ?? randomUUID(),
+      retries: true,
     });
 
     if (!result.ok) {
@@ -416,6 +585,7 @@ server.registerTool(
       reason: z.string().optional(),
       agent_id: z.string().optional(),
       session_id: z.string().optional(),
+      idempotency_key: z.string().optional(),
     },
   },
   async ({
@@ -427,6 +597,9 @@ server.registerTool(
     blocked_reason,
     source,
     reason,
+    agent_id,
+    session_id,
+    idempotency_key,
   }) => {
     const result = await request(`/tasks/${task_id}`, {
       method: "PATCH",
@@ -438,7 +611,11 @@ server.registerTool(
         blocked_reason,
         source,
         note: reason,
+        agent_id,
+        session_id,
       },
+      idempotencyKey: idempotency_key ?? randomUUID(),
+      retries: true,
     });
 
     if (!result.ok) {
@@ -468,6 +645,7 @@ server.registerTool(
       reason: z.string().optional(),
       agent_id: z.string().optional(),
       session_id: z.string().optional(),
+      idempotency_key: z.string().optional(),
     },
   },
   async ({
@@ -480,6 +658,9 @@ server.registerTool(
     blocked_reason,
     source,
     reason,
+    agent_id,
+    session_id,
+    idempotency_key,
   }) => {
     const tasks = await getProjectTasks(project_id);
     if (!tasks) {
@@ -512,7 +693,11 @@ server.registerTool(
         blocked_reason,
         source,
         note: reason,
+        agent_id,
+        session_id,
       },
+      idempotencyKey: idempotency_key ?? randomUUID(),
+      retries: true,
     });
 
     if (!updateResult.ok) {
@@ -540,9 +725,10 @@ server.registerTool(
     inputSchema: {
       task_id: z.number().int(),
       confirm: z.literal("DELETE"),
+      idempotency_key: z.string().optional(),
     },
   },
-  async ({ task_id }) => {
+  async ({ task_id, idempotency_key }) => {
     const getResult = await request(`/tasks/${task_id}`);
     if (!getResult.ok) {
       return asError("task_not_found", getResult.status, getResult.data);
@@ -550,6 +736,8 @@ server.registerTool(
 
     const deleteResult = await request(`/tasks/${task_id}`, {
       method: "DELETE",
+      idempotencyKey: idempotency_key ?? randomUUID(),
+      retries: true,
     });
     if (!deleteResult.ok) {
       return asError(
@@ -561,8 +749,10 @@ server.registerTool(
 
     return toSuccess({
       ok: true,
-      deleted_task: (deleteResult.data as { deleted_task?: unknown })
-        .deleted_task,
+      deleted_task:
+        (deleteResult.data as { deleted_task?: unknown; soft_deleted_task?: unknown })
+          .deleted_task ??
+        (deleteResult.data as { soft_deleted_task?: unknown }).soft_deleted_task,
     });
   },
 );
@@ -580,9 +770,10 @@ server.registerTool(
       agent_id: z.string().optional(),
       session_id: z.string().optional(),
       blocked_reason: z.string().optional(),
+      idempotency_key: z.string().optional(),
     },
   },
-  async ({ task_id, status, reason, source, blocked_reason }) => {
+  async ({ task_id, status, reason, source, blocked_reason, agent_id, session_id, idempotency_key }) => {
     if (blocked_reason && status === "blocked") {
       const patchResult = await request(`/tasks/${task_id}`, {
         method: "PATCH",
@@ -591,7 +782,11 @@ server.registerTool(
           blocked_reason,
           source,
           note: reason,
+          agent_id,
+          session_id,
         },
+        idempotencyKey: idempotency_key ?? randomUUID(),
+        retries: true,
       });
       if (!patchResult.ok) {
         return asError(
@@ -609,7 +804,12 @@ server.registerTool(
         status,
         source,
         note: reason,
+        blocked_reason,
+        agent_id,
+        session_id,
       },
+      idempotencyKey: idempotency_key ?? randomUUID(),
+      retries: true,
     });
     if (!result.ok) {
       return asError("update_task_status_failed", result.status, result.data);
@@ -631,15 +831,18 @@ server.registerTool(
       agent_id: z.string().optional(),
       session_id: z.string().optional(),
       apply_automation: z.boolean().optional(),
+      idempotency_key: z.string().optional(),
     },
   },
-  async ({ task_id, note, source, apply_automation }) => {
+  async ({ task_id, note, source, apply_automation, idempotency_key }) => {
     const result = await request(`/tasks/${task_id}/notes`, {
       method: "POST",
       body: {
         note,
         source,
       },
+      idempotencyKey: idempotency_key ?? randomUUID(),
+      retries: true,
     });
     if (!result.ok) {
       return asError("add_task_note_failed", result.status, result.data);
@@ -665,9 +868,10 @@ server.registerTool(
       source: z.string().optional(),
       agent_id: z.string().optional(),
       session_id: z.string().optional(),
+      idempotency_key: z.string().optional(),
     },
   },
-  async ({ project_id, context, dry_run, apply }) => {
+  async ({ project_id, context, dry_run, apply, idempotency_key }) => {
     const shouldApply = apply ?? (dry_run !== undefined ? !dry_run : false);
     const result = await request(`/agent/projects/${project_id}/plan`, {
       method: "POST",
@@ -675,11 +879,129 @@ server.registerTool(
         context,
         dry_run: !shouldApply,
       },
+      idempotencyKey: idempotency_key ?? randomUUID(),
+      retries: true,
     });
     if (!result.ok) {
       return asError("plan_from_context_failed", result.status, result.data);
     }
 
+    return toSuccess(result.data);
+  },
+);
+
+server.registerTool(
+  "backlog.get_focus",
+  {
+    title: "Get focus",
+    description:
+      "Returns what matters now for a project: top priority, blocked, stale, and in progress tasks.",
+    inputSchema: {
+      project_id: z.number().int(),
+      stale_hours: z.number().int().min(1).max(168).optional(),
+    },
+  },
+  async ({ project_id, stale_hours }) => {
+    const query = stale_hours ? `?stale_hours=${stale_hours}` : "";
+    const result = await request(`/projects/${project_id}/focus${query}`);
+    if (!result.ok) {
+      return asError("get_focus_failed", result.status, result.data);
+    }
+    return toSuccess(result.data);
+  },
+);
+
+server.registerTool(
+  "backlog.claim_task",
+  {
+    title: "Claim task",
+    description:
+      "Claims a task with TTL for an agent/session to avoid multi-agent collisions.",
+    inputSchema: {
+      task_id: z.number().int(),
+      agent_id: z.string().min(1).max(120),
+      session_id: z.string().min(1).max(120),
+      ttl_seconds: z.number().int().min(30).max(14400).optional(),
+      note: z.string().max(500).optional(),
+      source: z.string().optional(),
+      idempotency_key: z.string().optional(),
+    },
+  },
+  async ({ task_id, agent_id, session_id, ttl_seconds, note, source, idempotency_key }) => {
+    const result = await request(`/tasks/${task_id}/claim`, {
+      method: "POST",
+      body: {
+        agent_id,
+        session_id,
+        ttl_seconds,
+        note,
+        source,
+      },
+      idempotencyKey: idempotency_key ?? randomUUID(),
+      retries: true,
+    });
+
+    if (!result.ok) {
+      return asError("claim_task_failed", result.status, result.data);
+    }
+    return toSuccess(result.data);
+  },
+);
+
+server.registerTool(
+  "backlog.release_task",
+  {
+    title: "Release task claim",
+    description: "Releases an active task claim for the given agent/session.",
+    inputSchema: {
+      task_id: z.number().int(),
+      agent_id: z.string().min(1).max(120),
+      session_id: z.string().min(1).max(120),
+      source: z.string().optional(),
+      idempotency_key: z.string().optional(),
+    },
+  },
+  async ({ task_id, agent_id, session_id, source, idempotency_key }) => {
+    const result = await request(`/tasks/${task_id}/release`, {
+      method: "POST",
+      body: {
+        agent_id,
+        session_id,
+        source,
+      },
+      idempotencyKey: idempotency_key ?? randomUUID(),
+      retries: true,
+    });
+
+    if (!result.ok) {
+      return asError("release_task_failed", result.status, result.data);
+    }
+    return toSuccess(result.data);
+  },
+);
+
+server.registerTool(
+  "backlog.restore_task",
+  {
+    title: "Restore task",
+    description:
+      "Restores a soft-deleted task within restore window.",
+    inputSchema: {
+      task_id: z.number().int(),
+      source: z.string().optional(),
+      idempotency_key: z.string().optional(),
+    },
+  },
+  async ({ task_id, source, idempotency_key }) => {
+    const result = await request(`/tasks/${task_id}/restore`, {
+      method: "POST",
+      body: { source },
+      idempotencyKey: idempotency_key ?? randomUUID(),
+      retries: true,
+    });
+    if (!result.ok) {
+      return asError("restore_task_failed", result.status, result.data);
+    }
     return toSuccess(result.data);
   },
 );

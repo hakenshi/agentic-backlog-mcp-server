@@ -7,6 +7,8 @@ This package runs over `stdio` (Node.js) and forwards MCP tool calls to a runnin
 ## Exposed tools
 
 - `backlog.identify_project`
+- `backlog.health`
+- `backlog.version`
 - `backlog.list_projects`
 - `backlog.get_project`
 - `backlog.get_kanban_url`
@@ -20,6 +22,10 @@ This package runs over `stdio` (Node.js) and forwards MCP tool calls to a runnin
 - `backlog.update_task_status`
 - `backlog.add_task_note`
 - `backlog.plan_from_context`
+- `backlog.get_focus`
+- `backlog.claim_task`
+- `backlog.release_task`
+- `backlog.restore_task`
 - `backlog.get_board`
 - `backlog.get_console_table`
 
@@ -31,7 +37,9 @@ This package runs over `stdio` (Node.js) and forwards MCP tool calls to a runnin
 
 ```bash
 BACKLOG_API_BASE_URL=http://127.0.0.1:38117
-BACKLOG_API_KEY=
+BACKLOG_REQUEST_TIMEOUT_MS=1800
+BACKLOG_API_FAIL_FAST_MS=15000
+BACKLOG_API_FAILURE_THRESHOLD=1
 ```
 
 ## Run locally
@@ -59,8 +67,7 @@ npm run dev
       "command": "npx",
       "args": ["-y", "@hakenshi/agentic-backlog-mcp-server"],
       "env": {
-        "BACKLOG_API_BASE_URL": "http://127.0.0.1:38117",
-        "BACKLOG_API_KEY": ""
+        "BACKLOG_API_BASE_URL": "http://127.0.0.1:38117"
       }
     }
   }
@@ -73,3 +80,4 @@ npm run dev
 - Do not use `console.log` in MCP stdio mode (stdout breaks JSON-RPC). Logs must go to `stderr`.
 - `backlog.delete_task` requires explicit `confirm: "DELETE"`.
 - `backlog.plan_from_context` is preview-only by default. Set `apply: true` to persist changes.
+- API resilience is fail-fast: when repeated timeout/5xx errors happen, the server opens a short circuit window and returns immediate 503 errors so agent runs do not stall.
